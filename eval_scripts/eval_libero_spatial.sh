@@ -50,8 +50,9 @@ echo ""
 
 # 评估配置（这些都有默认值，但建议根据训练配置设置）
 EVAL_GPUS=${EVAL_GPUS:-"0,1"}          # 使用GPU（默认：0,1）
-NUM_TRIALS=${NUM_TRIALS:-50}             # 每个任务试验次数（默认：4）
+NUM_TRIALS=${NUM_TRIALS:-50}             # 每个任务试验次数（默认：20，可设为50获得更稳定结果）
 LORA_RANK=${LORA_RANK:-8}               # LoRA rank（默认：8，应与训练配置一致）
+PRUNE_MIN_KEEP_RATIO=${PRUNE_MIN_KEEP_RATIO:-0.1}  # 视觉Token筛选比例（留空使用checkpoint配置）
 
 # 从checkpoint路径自动推断输出目录
 CHECKPOINT_DIR=$(dirname "${CHECKPOINT_PATH}")
@@ -61,9 +62,13 @@ mkdir -p "${OUTPUT_DIR}"
 echo "⚙️  评测配置："
 echo "  - Checkpoint: ${CHECKPOINT_PATH}"
 echo "  - GPU: ${EVAL_GPUS}"
-echo "  - 每任务试验次数: ${NUM_TRIALS}"
+echo "  - 每任务试验次数: ${NUM_TRIALS} (💡 设置为50可获得更稳定结果，但会慢2.5倍)"
 echo "  - LoRA Rank: ${LORA_RANK}"
-echo "  - 视觉Token筛选: 使用checkpoint的config.json配置（如需覆盖，设置PRUNE_MIN_KEEP_RATIO）"
+if [ -n "${PRUNE_MIN_KEEP_RATIO}" ]; then
+    echo "  - 视觉Token筛选: ${PRUNE_MIN_KEEP_RATIO}"
+else
+    echo "  - 视觉Token筛选: 使用checkpoint的config.json配置"
+fi
 echo "  - 日志目录: ${OUTPUT_DIR}"
 echo ""
 
@@ -76,25 +81,44 @@ echo "🚀 开始评测..."
 echo "============================================"
 echo ""
 
-# 运行评测
-python -u experiments/robot/libero/run_libero_eval.py \
-    --pretrained_checkpoint "${CHECKPOINT_PATH}" \
-    --task_suite_name "libero_spatial" \
+# 记录开始时间
+EVAL_START_TIME=$(date +%s)
+
+# 构建评测命令
+EVAL_CMD="python -u experiments/robot/libero/run_libero_eval.py \
+    --pretrained_checkpoint \"${CHECKPOINT_PATH}\" \
+    --task_suite_name \"libero_spatial\" \
     --use_l1_regression True \
     --use_diffusion False \
     --use_film False \
     --num_images_in_input 2 \
     --use_proprio True \
-    --lora_rank ${LORA_RANK} \
-    --prune_min_keep_ratio ${PRUNE_MIN_KEEP_RATIO} \
-    --center_crop False \
+    --lora_rank ${LORA_RANK}"
+
+# 如果指定了 prune_min_keep_ratio，添加该参数
+if [ -n "${PRUNE_MIN_KEEP_RATIO}" ]; then
+    EVAL_CMD="${EVAL_CMD} \
+    --prune_min_keep_ratio ${PRUNE_MIN_KEEP_RATIO}"
+fi
+
+EVAL_CMD="${EVAL_CMD} \
+    --center_crop True \
     --num_trials_per_task ${NUM_TRIALS} \
-    --run_id_note "eval_$(basename "${CHECKPOINT_PATH}" | sed 's/--.*//')" \
-    --local_log_dir "${OUTPUT_DIR}" \
+    --run_id_note \"eval_\$(basename \"${CHECKPOINT_PATH}\" | sed 's/--.*//')\" \
+    --local_log_dir \"${OUTPUT_DIR}\" \
     --save_rollout_video False \
-    --seed 7 2>&1 | tee "${OUTPUT_DIR}/eval_$(basename "${CHECKPOINT_PATH}" | sed 's/--.*//')_$(date +%Y%m%d_%H%M%S).log"
+    --seed 7"
+
+# 运行评测
+eval ${EVAL_CMD} 2>&1 | tee "${OUTPUT_DIR}/eval_$(basename "${CHECKPOINT_PATH}" | sed 's/--.*//')_$(date +%Y%m%d_%H%M%S).log"
 
 EVAL_EXIT_CODE=$?
+
+# 计算总时长
+EVAL_END_TIME=$(date +%s)
+EVAL_DURATION=$((EVAL_END_TIME - EVAL_START_TIME))
+EVAL_MINUTES=$((EVAL_DURATION / 60))
+EVAL_SECONDS=$((EVAL_DURATION % 60))
 
 echo ""
 echo "============================================"
@@ -103,6 +127,7 @@ if [ ${EVAL_EXIT_CODE} -eq 0 ]; then
 else
     echo "❌ 评测失败 (exit code: ${EVAL_EXIT_CODE})"
 fi
+echo "⏱️  总耗时: ${EVAL_MINUTES}分${EVAL_SECONDS}秒 (${EVAL_DURATION}秒)"
 echo "============================================"
 echo ""
 

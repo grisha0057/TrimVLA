@@ -211,4 +211,5 @@ checkpoints/
 datasets/
 rollouts/
 LIBERO/
-monitor_gpu.py
+util_scripts/
+overfit_experiment/

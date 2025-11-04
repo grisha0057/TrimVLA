@@ -1151,6 +1151,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Start training
     vla.train()
     optimizer.zero_grad()
+    # Track last checkpoint step to avoid duplicate saves (e.g., around boundaries)
+    last_saved_step = -1
     for batch_idx, batch in enumerate(dataloader):
 
         # Compute gradient step index
@@ -1280,7 +1282,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
         # Save model checkpoint: either keep latest checkpoint only or all checkpoints
         # Step 1: 先同步所有进程，确保都到达这个点
-        if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+        should_save = gradient_step_idx > 0 and (log_step % cfg.save_freq == 0) and (log_step != last_saved_step)
+        if should_save:
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
             
@@ -1301,6 +1304,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Step 3: 保存完成后，再次同步，确保其他进程等待主进程完成
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
+            # 记录本次已保存的步数，避免重复保存
+            last_saved_step = log_step
 
         # Test model on validation set
         if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
@@ -1323,7 +1328,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             vla.train()
 
         # Stop training when max_steps is reached
-        if log_step == cfg.max_steps:
+        if log_step >= cfg.max_steps:
             # 只让主进程打印停止消息，避免重复
             if distributed_state.is_main_process:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")

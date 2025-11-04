@@ -211,3 +211,4 @@ checkpoints/
 datasets/
 rollouts/
 LIBERO/
+monitor_gpu.py

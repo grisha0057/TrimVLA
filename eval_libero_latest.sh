@@ -1,11 +1,36 @@
 #!/bin/bash
 
-# 评测 Step 50 Checkpoint (最新训练)
+# 评测 LIBERO Checkpoint
+# 使用方法:
+#   1. 通过环境变量传递（推荐）:
+#      CHECKPOINT_PATH="/path/to/checkpoint" ./eval_libero_latest.sh
+#   2. 通过命令行参数传递:
+#      ./eval_libero_latest.sh [checkpoint_path]
+#   3. 直接运行（使用默认路径）:
+#      ./eval_libero_latest.sh
 
 set -e
 
+# 获取 checkpoint 路径（优先级：环境变量 > 命令行参数 > 默认值）
+if [ -n "${CHECKPOINT_PATH}" ]; then
+    # 使用环境变量中的路径（用户已经设置了）
+    :
+elif [ $# -ge 1 ]; then
+    # 使用命令行参数
+    CHECKPOINT_PATH="$1"
+else
+    # 使用默认checkpoint路径（可以修改为你要评测的checkpoint）
+    CHECKPOINT_PATH="/root/workspace/LightVLA/logs/libero_spatial_training/libero_spatial_from1400_20251102_142005/libero_spatial_from1400_20251102_1420052025-11-02 14:20:33.512042--1200_chkpt"
+fi
+
+# 验证checkpoint存在
+if [ ! -d "${CHECKPOINT_PATH}" ]; then
+    echo "❌ 错误: Checkpoint 不存在: ${CHECKPOINT_PATH}"
+    exit 1
+fi
+
 echo "============================================"
-echo "🎮 评测 Step 50 Checkpoint"
+echo "🎮 评测 LIBERO Checkpoint"
 echo "============================================"
 echo ""
 
@@ -19,33 +44,26 @@ export MUJOCO_GL=osmesa
 export PYOPENGL_PLATFORM=osmesa
 echo "✅ 使用 OSMesa 软件渲染"
 
-# Checkpoint 路径（使用最新训练的 Step 50）
-CHECKPOINT_PATH="/root/workspace/LightVLA/logs/libero_spatial_training/libero_spatial_20251027_093955/openvla-libero-spatial+libero_spatial_no_noops+b16+lr-0.0001+lora-r8+dropout-0.02025-10-27 09:40:23.659495--50_chkpt"
-# 验证checkpoint存在
-if [ ! -d "${CHECKPOINT_PATH}" ]; then
-    echo "❌ 错误: Checkpoint 不存在: ${CHECKPOINT_PATH}"
-    exit 1
-fi
-
 echo "📦 Checkpoint: ${CHECKPOINT_PATH}"
 echo "📊 Checkpoint 大小: $(du -sh "${CHECKPOINT_PATH}" | cut -f1)"
 echo ""
 
-# 评估配置
-EVAL_GPUS="0,1"          # 使用2个GPU评测（当前系统只有2个GPU）
-NUM_TRIALS=4             # 每个任务4次试验
-LORA_RANK=8              # LoRA rank
-# 注意：Coverage将使用checkpoint中保存的config.json配置（prune_target_coverage=0.95）
+# 评估配置（这些都有默认值，但建议根据训练配置设置）
+EVAL_GPUS=${EVAL_GPUS:-"0,1"}          # 使用GPU（默认：0,1）
+NUM_TRIALS=${NUM_TRIALS:-50}             # 每个任务试验次数（默认：4）
+LORA_RANK=${LORA_RANK:-8}               # LoRA rank（默认：8，应与训练配置一致）
 
-# 输出目录
-OUTPUT_DIR="/root/workspace/LightVLA/logs/libero_spatial_training/libero_spatial_20251027_085014/eval_logs"
+# 从checkpoint路径自动推断输出目录
+CHECKPOINT_DIR=$(dirname "${CHECKPOINT_PATH}")
+OUTPUT_DIR="${CHECKPOINT_DIR}/eval_logs"
 mkdir -p "${OUTPUT_DIR}"
 
 echo "⚙️  评测配置："
+echo "  - Checkpoint: ${CHECKPOINT_PATH}"
 echo "  - GPU: ${EVAL_GPUS}"
 echo "  - 每任务试验次数: ${NUM_TRIALS}"
 echo "  - LoRA Rank: ${LORA_RANK}"
-echo "  - Coverage: 使用checkpoint的config.json配置"
+echo "  - 视觉Token筛选: 使用checkpoint的config.json配置（如需覆盖，设置PRUNE_MIN_KEEP_RATIO）"
 echo "  - 日志目录: ${OUTPUT_DIR}"
 echo ""
 
@@ -68,12 +86,13 @@ python -u experiments/robot/libero/run_libero_eval.py \
     --num_images_in_input 2 \
     --use_proprio True \
     --lora_rank ${LORA_RANK} \
+    --prune_min_keep_ratio ${PRUNE_MIN_KEEP_RATIO} \
     --center_crop False \
     --num_trials_per_task ${NUM_TRIALS} \
-    --run_id_note "step_50_eval" \
+    --run_id_note "eval_$(basename "${CHECKPOINT_PATH}" | sed 's/--.*//')" \
     --local_log_dir "${OUTPUT_DIR}" \
     --save_rollout_video False \
-    --seed 7 2>&1 | tee "${OUTPUT_DIR}/eval_step50_$(date +%Y%m%d_%H%M%S).log"
+    --seed 7 2>&1 | tee "${OUTPUT_DIR}/eval_$(basename "${CHECKPOINT_PATH}" | sed 's/--.*//')_$(date +%Y%m%d_%H%M%S).log"
 
 EVAL_EXIT_CODE=$?
 
@@ -90,7 +109,7 @@ echo ""
 # 显示结果摘要
 echo "📊 结果摘要："
 echo "============================================"
-LATEST_LOG=$(ls -t "${OUTPUT_DIR}"/eval_step50_*.log 2>/dev/null | head -1)
+LATEST_LOG=$(ls -t "${OUTPUT_DIR}"/eval_*.log 2>/dev/null | head -1)
 if [ -f "${LATEST_LOG}" ]; then
     echo "最新日志: ${LATEST_LOG}"
     echo ""

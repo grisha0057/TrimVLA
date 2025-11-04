@@ -1,6 +1,24 @@
 #!/bin/bash
 
+# LightVLA - LIBERO Spatial 完整训练脚本
+# 基于完整的 libero_spatial_no_noops 数据集训练
+# 包含新的视觉 token 筛选逻辑（ST‑TopK 训练门控）
+# 每50步进行一次在线推理评估
+
+set -e
+set -o pipefail
+
+# ========== Conda 环境激活 ==========
+# 初始化 conda（如果需要）
+eval "$(conda shell.bash hook)"
+# 激活 openvla-oft 环境
+conda activate openvla-oft
+echo "✅ 已激活 conda 环境: openvla-oft"
+echo "   Python: $(which python)"
+echo ""
+
 # ========== 渲染配置 ==========
+# 使用 OSMesa 软件渲染（适用于无EGL支持的容器环境）
 export MUJOCO_GL=osmesa
 export PYOPENGL_PLATFORM=osmesa
 
@@ -13,7 +31,7 @@ export PYTHONUNBUFFERED=1
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
 export TORCH_CUDNN_V8_API_ENABLED=1
 
-# ========== 路径配置 ==========
+# ========== 路径配置（支持外部覆盖） ==========
 VLA_PATH=${VLA_PATH:-"/root/workspace/LightVLA/checkpoints/openvla-libero-spatial"}
 DATA_ROOT_DIR=${DATA_ROOT_DIR:-"/root/workspace/LightVLA/datasets/rlds/modified_libero_rlds_full"}
 DATASET_NAME=${DATASET_NAME:-"libero_spatial_no_noops"}
@@ -23,31 +41,35 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-"libero_spatial_$(date +%Y%m%d_%H%M%S)"}
 # ========== 训练超参数（与 overfit 实验保持一致）==========
 # 学习率与调度
 LR=${LR:-1e-4}
-MAX_STEPS=${MAX_STEPS:-1400}
-WARMUP_STEPS=${WARMUP_STEPS:-0}
+MAX_STEPS=${MAX_STEPS:-8000}
+WARMUP_STEPS=${WARMUP_STEPS:-800}
 DECAY_MILESTONES=${DECAY_MILESTONES:-"[100000]"}  # 基本不衰减
 DECAY_GAMMA=${DECAY_GAMMA:-0.5}
 
 # 批次与梯度累积（优化后：提升GPU利用率）
-BATCH_SIZE=${BATCH_SIZE:-4}
+BATCH_SIZE=${BATCH_SIZE:-2}
 GRAD_ACCUMULATION=${GRAD_ACCUMULATION:-8}
 
 # LoRA 配置（与 overfit 一致）
 LORA_RANK=${LORA_RANK:-8}
 
 # 保存策略
-SAVE_FREQ=${SAVE_FREQ:-200}
+SAVE_FREQ=${SAVE_FREQ:-1000}                      # 每1000步保存+评估
 SAVE_LATEST_ONLY=${SAVE_LATEST_ONLY:-False}
 
-IMAGE_AUG=${IMAGE_AUG:-True}
+# 数据增强（与 overfit 一致：关闭）
+IMAGE_AUG=${IMAGE_AUG:-False}
 
-# 禁用筛选
+# ========== 视觉 Token 筛选配置（与 overfit 一致）==========
+# 启用/禁用筛选
 PRUNE_DISABLE=${PRUNE_DISABLE:-False}
 
-# Coverage 参数（副旋钮）：跟随最小保留
+# Coverage 参数（副旋钮）：跟随最小保留或独立调度
 COVERAGE_WARMUP=${COVERAGE_WARMUP:-1.0}
+COVERAGE_TARGET=${COVERAGE_TARGET:-0.40}
+PRUNE_COVERAGE_RAMP_STEPS=${PRUNE_COVERAGE_RAMP_STEPS:-2000}
 PRUNE_COVERAGE_FOLLOW_MIN_KEEP=${PRUNE_COVERAGE_FOLLOW_MIN_KEEP:-True}
-PRUNE_COVERAGE_OFFSET=${PRUNE_COVERAGE_OFFSET:-0.05}
+PRUNE_COVERAGE_OFFSET=${PRUNE_COVERAGE_OFFSET:-0.08}
 
 # 聚合方式：logsumexp（推荐）| mean | max
 PRUNE_AGGREGATION=${PRUNE_AGGREGATION:-"logsumexp"}
@@ -55,22 +77,22 @@ PRUNE_LSE_TEMP=${PRUNE_LSE_TEMP:-1.0}      # LogSumExp 温度参数
 
 # Soft rescale 参数
 PRUNE_RESCALE=${PRUNE_RESCALE:-True}        # 启用均值保持的 rescale
-PRUNE_CLIP=${PRUNE_CLIP:-10.0}             # Rescale 裁剪阈值
+PRUNE_CLIP=${PRUNE_CLIP:-5.0}             # Rescale 裁剪阈值
 
 # ST-TopK 训练（Gumbel-Softmax + 直通）
 PRUNE_TRAIN_USE_ST_TOPK=${PRUNE_TRAIN_USE_ST_TOPK:-True}
 PRUNE_TAU_START=${PRUNE_TAU_START:-1.0}
 PRUNE_TAU_END=${PRUNE_TAU_END:-0.30}
-PRUNE_TAU_RAMP_STEPS=${PRUNE_TAU_RAMP_STEPS:-1200}
+PRUNE_TAU_RAMP_STEPS=${PRUNE_TAU_RAMP_STEPS:-5200}
 
 # 最小保留比例（主旋钮）
 PRUNE_DISABLE_KEEP_BINS=${PRUNE_DISABLE_KEEP_BINS:-True}
 PRUNE_MIN_KEEP_RATIO_WARMUP=${PRUNE_MIN_KEEP_RATIO_WARMUP:-1.0}
 PRUNE_MIN_KEEP_RATIO_TARGET=${PRUNE_MIN_KEEP_RATIO_TARGET:-0.20}
-PRUNE_MIN_KEEP_RAMP_STEPS=${PRUNE_MIN_KEEP_RAMP_STEPS:-1200}
+PRUNE_MIN_KEEP_RAMP_STEPS=${PRUNE_MIN_KEEP_RAMP_STEPS:-7000}
 
 # ========== 评估配置 ==========
-EVAL_NUM_TRIALS=${EVAL_NUM_TRIALS:-3}       # 每个任务评估3次（快速评估）
+EVAL_NUM_TRIALS=${EVAL_NUM_TRIALS:-10}
 EVAL_GPUS=${EVAL_GPUS:-"0,1"}               # 评估使用的GPU
 
 # ========== 分布式训练配置 ==========
@@ -83,6 +105,22 @@ export CUDA_VISIBLE_DEVICES=${CUDA_DEVICES}
 export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-29500}
 
+# # NCCL 配置
+# export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-lo}
+# export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+# export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
+# export NCCL_SOCKET_FAMILY=${NCCL_SOCKET_FAMILY:-AF_INET}
+# export NCCL_ASYNC_ERROR_HANDLING=${NCCL_ASYNC_ERROR_HANDLING:-1}
+# export NCCL_BLOCKING_WAIT=${NCCL_BLOCKING_WAIT:-0}
+
+# # Gloo 配置
+# export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
+# export GLOO_DISABLE_IPV6=${GLOO_DISABLE_IPV6:-1}
+# export GLOO_DEVICE_TRANSPORT=${GLOO_DEVICE_TRANSPORT:-TCP}
+
+# 调试
+export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-OFF}
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 
 # ========== 前置检查 ==========
 echo "============================================"
@@ -108,7 +146,7 @@ echo ""
 echo "🔍 视觉 Token 筛选："
 echo "  - 启用: $([ "${PRUNE_DISABLE}" = "False" ] && echo '✅' || echo '❌')"
 echo "  - 最小保留比例: ${PRUNE_MIN_KEEP_RATIO_WARMUP} -> ${PRUNE_MIN_KEEP_RATIO_TARGET} (ramp ${PRUNE_MIN_KEEP_RAMP_STEPS})"
-echo "  - Coverage: 跟随 min_keep_ratio (follow_min_keep=${PRUNE_COVERAGE_FOLLOW_MIN_KEEP}, +${PRUNE_COVERAGE_OFFSET})"
+echo "  - Coverage: ${COVERAGE_WARMUP} -> ${COVERAGE_TARGET} (follow_min_keep=${PRUNE_COVERAGE_FOLLOW_MIN_KEEP}, +${PRUNE_COVERAGE_OFFSET})"
 echo "  - 量化桶: $([ "${PRUNE_DISABLE_KEEP_BINS}" = "True" ] && echo '禁用' || echo '启用')"
 echo "  - Gumbel 温度: ${PRUNE_TAU_START} -> ${PRUNE_TAU_END} (ramp ${PRUNE_TAU_RAMP_STEPS})"
 echo "  - 聚合方式: ${PRUNE_AGGREGATION}"
@@ -153,9 +191,11 @@ echo ""
 echo "✅ 检查通过"
 echo ""
 
-# ========== 创建实验目录 ==========
+# （简化）不做断点续训自动识别；始终从起点按分段日程训练
+
+# ========== 创建/复用实验目录 ==========
 EXPERIMENT_DIR="${RUN_ROOT_DIR}/${EXPERIMENT_NAME}"
-mkdir -p ${EXPERIMENT_DIR}
+mkdir -p "${EXPERIMENT_DIR}"
 LOG_FILE="${EXPERIMENT_DIR}/train.log"
 EVAL_LOG_FILE="${EXPERIMENT_DIR}/eval_results.log"
 
@@ -182,7 +222,7 @@ cat > ${EXPERIMENT_DIR}/config.txt <<EOF
 
 视觉 Token 筛选:
   禁用: ${PRUNE_DISABLE}
-  Coverage: 跟随 min_keep_ratio (+${PRUNE_COVERAGE_OFFSET})
+  Coverage: ${COVERAGE_WARMUP} -> ${COVERAGE_TARGET}
   聚合: ${PRUNE_AGGREGATION}
   温度: ${PRUNE_LSE_TEMP}
   Rescale: ${PRUNE_RESCALE}
@@ -209,49 +249,49 @@ run_evaluation() {
     local checkpoint_path=$1
     local step=$2
     
-    # 根据当前 step 计算评测用的 min_keep_ratio 与 coverage
-    local ratio_warm=${PRUNE_MIN_KEEP_RATIO_WARMUP}
-    local ratio_tgt=${PRUNE_MIN_KEEP_RATIO_TARGET}
-    local ratio_ramp=${PRUNE_MIN_KEEP_RAMP_STEPS}
-    local cov_follow=${PRUNE_COVERAGE_FOLLOW_MIN_KEEP}
-    local cov_off=${PRUNE_COVERAGE_OFFSET}
+    # 三阶段日程
     local ratio
-    if [ ${step} -lt ${WARMUP_STEPS} ]; then
-        ratio=${ratio_warm}
-    else
-        # 线性插值：从 warmup 步开始到 ramp 完成
-        local passed=$(( step - WARMUP_STEPS ))
-        if [ ${passed} -lt 0 ]; then passed=0; fi
-        if [ ${ratio_ramp} -le 0 ]; then
-            ratio=${ratio_tgt}
-        else
-            # clamp 到 [0,1]
-            local num=$(python - <<PY
-passed=${passed}
-ratio_ramp=${ratio_ramp}
-print(min(1.0, max(0.0, passed/ratio_ramp)))
-PY
-)
-            ratio=$(python - <<PY
-rw=${ratio_warm}
-rt=${ratio_tgt}
-p=${num}
+    if [ ${step} -lt 800 ]; then
+        ratio=1.0
+    elif [ ${step} -le 3200 ]; then
+        ratio=$(python - <<PY
+S=${step}
+rw=1.0; rt=0.60; s0=800; s1=3200
+p=max(0.0, min(1.0, (S - s0) / float(s1 - s0)))
 print((1.0-p)*rw + p*rt)
 PY
 )
-        fi
+    elif [ ${step} -le 5600 ]; then
+        ratio=$(python - <<PY
+S=${step}
+rw=0.60; rt=0.28; s0=3200; s1=5600
+p=max(0.0, min(1.0, (S - s0) / float(s1 - s0)))
+print((1.0-p)*rw + p*rt)
+PY
+)
+    elif [ ${step} -le 5800 ]; then
+        ratio=0.28
+    elif [ ${step} -le 7600 ]; then
+        ratio=$(python - <<PY
+S=${step}
+rw=0.28; rt=0.20; s0=5800; s1=7600
+p=max(0.0, min(1.0, (S - s0) / float(s1 - s0)))
+print((1.0-p)*rw + p*rt)
+PY
+)
+    else
+        ratio=0.20
     fi
     local cov
-    if [ "${cov_follow}" = "True" ]; then
+    if [ "${PRUNE_COVERAGE_FOLLOW_MIN_KEEP}" = "True" ]; then
         cov=$(python - <<PY
 ratio=${ratio}
-off=${cov_off}
+off=${PRUNE_COVERAGE_OFFSET}
 print(min(0.999, ratio+off))
 PY
 )
     else
-        echo "❌ 错误: PRUNE_COVERAGE_FOLLOW_MIN_KEEP 必须为 True"
-        exit 1
+        cov=${COVERAGE_TARGET}
     fi
     
     echo ""
@@ -281,7 +321,7 @@ PY
         --num_images_in_input 2 \
         --use_proprio True \
         --lora_rank ${LORA_RANK} \
-        --center_crop True \
+        --center_crop False \
         --num_trials_per_task ${EVAL_NUM_TRIALS} \
         --prune_disable_keep_bins ${PRUNE_DISABLE_KEEP_BINS} \
         --prune_min_keep_ratio ${ratio} \
@@ -319,7 +359,7 @@ echo "📝 训练计划: 总共 ${MAX_STEPS} 步，分 ${NUM_STAGES} 个阶段"
 echo "   每阶段 ${SAVE_FREQ} 步后进行评估"
 echo ""
 
-# ========== Step 0: 评估初始模型（已跳过）==========
+# ========== Step 0 ==========
 echo "============================================"
 echo "⏭️  Step 0: 跳过初始模型评估（之前已评测）"
 echo "============================================"
@@ -355,7 +395,42 @@ for stage in $(seq 1 ${NUM_STAGES}); do
     echo "============================================"
     echo ""
     
-    # 训练这一阶段
+    # 训练这一阶段（按阶段传入剪枝调度超参）
+    # 计算本阶段对应的剪枝调度枢轴与目标
+    PHASE_WARM_STEP=800
+    PHASE_R0=1.0
+    PHASE_R1=0.60
+    PHASE_RAMP=2400
+    PHASE_TAU_S=${PRUNE_TAU_START}
+    PHASE_TAU_E=${PRUNE_TAU_END}
+    PHASE_TAU_R=${PRUNE_TAU_RAMP_STEPS}
+
+    if [ ${TARGET_STEP} -le 3200 ]; then
+        PHASE_WARM_STEP=800
+        PHASE_R0=1.0
+        PHASE_R1=0.60
+        PHASE_RAMP=2400
+        PHASE_TAU_S=${PRUNE_TAU_START}
+        PHASE_TAU_E=${PRUNE_TAU_END}
+        PHASE_TAU_R=${PRUNE_TAU_RAMP_STEPS}
+    elif [ ${TARGET_STEP} -le 5800 ]; then
+        PHASE_WARM_STEP=3200
+        PHASE_R0=0.60
+        PHASE_R1=0.28
+        PHASE_RAMP=2400   # 到5600结束，5600–5800平台
+        PHASE_TAU_S=0.30
+        PHASE_TAU_E=0.30
+        PHASE_TAU_R=1
+    else
+        PHASE_WARM_STEP=5800
+        PHASE_R0=0.28
+        PHASE_R1=0.20
+        PHASE_RAMP=1800   # 到7600结束，7600–8000平台
+        PHASE_TAU_S=0.30
+        PHASE_TAU_E=0.30
+        PHASE_TAU_R=1
+    fi
+
     # Python unbuffered 输出已通过 PYTHONUNBUFFERED=1 环境变量设置
     torchrun \
         --standalone \
@@ -388,6 +463,8 @@ for stage in $(seq 1 ${NUM_STAGES}); do
         --lora_rank ${LORA_RANK} \
         --prune_disable ${PRUNE_DISABLE} \
         --prune_coverage_warmup ${COVERAGE_WARMUP} \
+        --prune_coverage_target ${COVERAGE_TARGET} \
+        --prune_coverage_ramp_steps ${PRUNE_COVERAGE_RAMP_STEPS} \
         --prune_coverage_follow_min_keep ${PRUNE_COVERAGE_FOLLOW_MIN_KEEP} \
         --prune_coverage_offset ${PRUNE_COVERAGE_OFFSET} \
         --prune_prompt_aggregation ${PRUNE_AGGREGATION} \
@@ -395,13 +472,14 @@ for stage in $(seq 1 ${NUM_STAGES}); do
         --prune_soft_rescale_mean_preserve ${PRUNE_RESCALE} \
         --prune_soft_rescale_clip ${PRUNE_CLIP} \
         --prune_disable_keep_bins ${PRUNE_DISABLE_KEEP_BINS} \
-        --prune_min_keep_ratio_warmup ${PRUNE_MIN_KEEP_RATIO_WARMUP} \
-        --prune_min_keep_ratio_target ${PRUNE_MIN_KEEP_RATIO_TARGET} \
-        --prune_min_keep_ramp_steps ${PRUNE_MIN_KEEP_RAMP_STEPS} \
+        --prune_min_keep_ratio_warmup ${PHASE_R0} \
+        --prune_min_keep_ratio_target ${PHASE_R1} \
+        --prune_min_keep_ramp_steps ${PHASE_RAMP} \
+        --prune_schedule_warmup_step ${PHASE_WARM_STEP} \
         --prune_train_use_st_topk ${PRUNE_TRAIN_USE_ST_TOPK} \
-        --prune_train_gumbel_tau_start ${PRUNE_TAU_START} \
-        --prune_train_gumbel_tau_end ${PRUNE_TAU_END} \
-        --prune_train_gumbel_tau_ramp_steps ${PRUNE_TAU_RAMP_STEPS} \
+        --prune_train_gumbel_tau_start ${PHASE_TAU_S} \
+        --prune_train_gumbel_tau_end ${PHASE_TAU_E} \
+        --prune_train_gumbel_tau_ramp_steps ${PHASE_TAU_R} \
         --shuffle_buffer_size 10000 \
         --log_freq 10 2>&1 | tee -a ${LOG_FILE}
     

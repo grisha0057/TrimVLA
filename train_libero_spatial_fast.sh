@@ -18,25 +18,26 @@ VLA_PATH=${VLA_PATH:-"/root/workspace/LightVLA/checkpoints/openvla-libero-spatia
 DATA_ROOT_DIR=${DATA_ROOT_DIR:-"/root/workspace/LightVLA/datasets/rlds/modified_libero_rlds_full"}
 DATASET_NAME=${DATASET_NAME:-"libero_spatial_no_noops"}
 RUN_ROOT_DIR=${RUN_ROOT_DIR:-"/root/workspace/LightVLA/logs/libero_spatial_training"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"libero_spatial_$(date +%Y%m%d_%H%M%S)"}
+# 续训时使用原实验目录，避免创建新目录
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"libero_spatial_20251104_033909"}
 
 # ========== 训练超参数（与 overfit 实验保持一致）==========
 # 学习率与调度
 LR=${LR:-1e-4}
-MAX_STEPS=${MAX_STEPS:-1400}
+MAX_STEPS=${MAX_STEPS:-1600}
 WARMUP_STEPS=${WARMUP_STEPS:-0}
 DECAY_MILESTONES=${DECAY_MILESTONES:-"[100000]"}  # 基本不衰减
 DECAY_GAMMA=${DECAY_GAMMA:-0.5}
 
 # 批次与梯度累积（优化后：提升GPU利用率）
 BATCH_SIZE=${BATCH_SIZE:-4}
-GRAD_ACCUMULATION=${GRAD_ACCUMULATION:-8}
+GRAD_ACCUMULATION=${GRAD_ACCUMULATION:-4}
 
 # LoRA 配置（与 overfit 一致）
 LORA_RANK=${LORA_RANK:-8}
 
 # 保存策略
-SAVE_FREQ=${SAVE_FREQ:-200}
+SAVE_FREQ=${SAVE_FREQ:-100}
 SAVE_LATEST_ONLY=${SAVE_LATEST_ONLY:-False}
 
 IMAGE_AUG=${IMAGE_AUG:-True}
@@ -61,16 +62,16 @@ PRUNE_CLIP=${PRUNE_CLIP:-10.0}             # Rescale 裁剪阈值
 PRUNE_TRAIN_USE_ST_TOPK=${PRUNE_TRAIN_USE_ST_TOPK:-True}
 PRUNE_TAU_START=${PRUNE_TAU_START:-1.0}
 PRUNE_TAU_END=${PRUNE_TAU_END:-0.30}
-PRUNE_TAU_RAMP_STEPS=${PRUNE_TAU_RAMP_STEPS:-1200}
+PRUNE_TAU_RAMP_STEPS=${PRUNE_TAU_RAMP_STEPS:-1000}
 
-# 最小保留比例（主旋钮）
+# 最小保留比例（主旋钮）- 直接设置为 0.20，无渐变
 PRUNE_DISABLE_KEEP_BINS=${PRUNE_DISABLE_KEEP_BINS:-True}
-PRUNE_MIN_KEEP_RATIO_WARMUP=${PRUNE_MIN_KEEP_RATIO_WARMUP:-1.0}
-PRUNE_MIN_KEEP_RATIO_TARGET=${PRUNE_MIN_KEEP_RATIO_TARGET:-0.20}
-PRUNE_MIN_KEEP_RAMP_STEPS=${PRUNE_MIN_KEEP_RAMP_STEPS:-1200}
+PRUNE_MIN_KEEP_RATIO_WARMUP=${PRUNE_MIN_KEEP_RATIO_WARMUP:-0.10}
+PRUNE_MIN_KEEP_RATIO_TARGET=${PRUNE_MIN_KEEP_RATIO_TARGET:-0.10}
+PRUNE_MIN_KEEP_RAMP_STEPS=${PRUNE_MIN_KEEP_RAMP_STEPS:-0}
 
 # ========== 评估配置 ==========
-EVAL_NUM_TRIALS=${EVAL_NUM_TRIALS:-3}       # 每个任务评估3次（快速评估）
+EVAL_NUM_TRIALS=${EVAL_NUM_TRIALS:-5}       # 每个任务评估3次（快速评估）
 EVAL_GPUS=${EVAL_GPUS:-"0,1"}               # 评估使用的GPU
 
 # ========== 分布式训练配置 ==========
@@ -325,21 +326,24 @@ echo "⏭️  Step 0: 跳过初始模型评估（之前已评测）"
 echo "============================================"
 echo ""
 
-CURRENT_STEP=0
-LAST_CHECKPOINT_PATH="${VLA_PATH}"
+CURRENT_STEP=400
+LAST_CHECKPOINT_PATH="/root/workspace/LightVLA/logs/libero_spatial_training/libero_spatial_20251104_033909/libero_spatial_20251104_0339092025-11-04 04:37:20.583370--400_chkpt"
 
-for stage in $(seq 1 ${NUM_STAGES}); do
+# 计算起始阶段（从下一个checkpoint开始）
+START_STAGE=$((CURRENT_STEP / SAVE_FREQ + 1))
+
+for stage in $(seq ${START_STAGE} ${NUM_STAGES}); do
     TARGET_STEP=$((stage * SAVE_FREQ))
     STEPS_THIS_STAGE=$((TARGET_STEP - CURRENT_STEP))
     
     # 判断是否需要续训
-    if [ ${stage} -eq 1 ]; then
-        # 第一阶段：从头开始训练
+    if [ ${stage} -eq ${START_STAGE} ] && [ ${CURRENT_STEP} -eq 0 ]; then
+        # 第一阶段且从0开始：从头训练
         RESUME_FLAG="False"
         RESUME_STEP_ARG=""
         TRAIN_MODE="从头训练"
     else
-        # 后续阶段：从上一个checkpoint继续训练
+        # 其他情况：从上一个checkpoint继续训练
         RESUME_FLAG="True"
         RESUME_STEP_ARG="--resume_step ${CURRENT_STEP}"
         TRAIN_MODE="续训（从Step ${CURRENT_STEP}继续）"

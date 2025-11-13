@@ -114,7 +114,5 @@
 2. TODO: 与lightvla的比较
 3. TODO: 在自动驾驶场景可能的应用
 
-## 附录
-
-- **Github**: https://github.com/grisha0057/TrimVLA
+## checkpoints：
 - **Huggingface**: https://huggingface.co/grisha0057
